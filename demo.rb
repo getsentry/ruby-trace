@@ -5,15 +5,22 @@ def bar
   1/0
 end
 
-def foo a, b, pass=false
+def do_math a, b
   x = "#{a} + #{b} = #{a + b}"
-  bar unless pass
   x
+end
+
+def foo pass=false, depth=100
+  if depth == 0
+    bar unless pass
+  else
+    foo(pass, depth - 1)
+  end
 end
 
 def test
   RbTrace.capture_stack do
-    foo 1, 2
+    foo
   end
 end
 
@@ -24,7 +31,7 @@ def bench
     x.report('exc:normal') {
       n.times do
         begin
-          foo 1, 2
+          foo
         rescue
         end
       end
@@ -34,7 +41,7 @@ def bench
       RbTrace.make_tracepoint.enable do
         n.times do
           begin
-            foo 1, 2
+            foo
           rescue
           end
         end
@@ -43,7 +50,7 @@ def bench
 
     x.report('pass:normal') {
       n.times do
-        foo 1, 2, true
+        foo true
       end
     }
 
@@ -51,7 +58,7 @@ def bench
       RbTrace.make_tracepoint.enable do
         n.times do
           begin
-            foo 1, 2, true
+            foo true
           rescue
           end
         end

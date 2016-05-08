@@ -28,6 +28,7 @@ struct thread_stack_frame {
 
 struct thread_stack_state {
     struct thread_stack_frame *top;
+    struct thread_stack_frame *freelist;
 };
 
 static void
@@ -43,6 +44,13 @@ thread_stack_state_free(void *s)
     struct thread_stack_frame *frm, *prev;
 
     frm = state->top;
+    while (frm) {
+        prev = frm->prev;
+        thread_stack_frame_free(frm);
+        frm = prev;
+    }
+
+    frm = state->freelist;
     while (frm) {
         prev = frm->prev;
         thread_stack_frame_free(frm);
@@ -69,7 +77,7 @@ static VALUE
 thread_stack_state_alloc(VALUE self)
 {
     struct thread_stack_state *state = ALLOC(struct thread_stack_state);
-    state->top = NULL;
+    memset(state, 0, sizeof(struct thread_stack_state));
     return Data_Wrap_Struct(self, thread_stack_state_mark,
                             thread_stack_state_free, state);
 }
@@ -116,9 +124,15 @@ thread_stack_state_push(rb_trace_arg_t *targ)
 {
     struct thread_stack_state *state = thread_stack_state_get();
     struct thread_stack_frame *frm;
-    VALUE lineno = rb_tracearg_lineno(targ);
+    VALUE lineno;
 
-    frm = ALLOC(struct thread_stack_frame);
+    if (state->freelist) {
+        frm = state->freelist;
+        state->freelist = frm->prev;
+    } else {
+        frm = ALLOC(struct thread_stack_frame);
+    }
+    lineno = rb_tracearg_lineno(targ);
     frm->path = rb_tracearg_path(targ);
     frm->lineno = lineno != Qnil ? FIX2LONG(lineno) : 0;
     frm->method_id = rb_tracearg_method_id(targ);
@@ -135,7 +149,8 @@ thread_stack_state_pop(void)
     if (state->top) {
         frm = state->top;
         state->top = frm->prev;
-        thread_stack_frame_free(frm);
+        frm->prev = state->freelist;
+        state->freelist = frm;
     }
 }
 
@@ -213,8 +228,7 @@ Init_rbtrace(void)
     id_rbtrace_state = rb_intern("@__rbtrace_state");
 
     mod = rb_const_get(rb_cObject, rb_intern("RbTrace"));
-    rb_define_module_function(
-        mod, "make_tracepoint", tracepoint_create, 0);
+    frame_class = rb_const_get(mod, rb_intern("Frame"));
 
     thread_stack_state_class = rb_define_class_under(
         mod, "StackState", rb_cObject);
@@ -224,5 +238,6 @@ Init_rbtrace(void)
     rb_define_method(thread_stack_state_class, "frames",
                      thread_stack_state_get_frames, 0);
 
-    frame_class = rb_const_get(mod, rb_intern("Frame"));
+    rb_define_module_function(
+        mod, "make_tracepoint", tracepoint_create, 0);
 }
