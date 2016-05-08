@@ -17,12 +17,19 @@ static ID id_rbtrace_state;
 static VALUE thread_stack_state_class;
 static VALUE frame_class;
 
+struct rb_trace_arg_struct_partial {
+    unsigned long event_padding;
+    void *th;
+    void *cfp;
+};
+
 struct thread_stack_frame;
 struct thread_stack_frame {
     VALUE path;
     long lineno;
     VALUE method_id;
-    VALUE binding;
+    void *th;
+    void *cfp;
     struct thread_stack_frame *prev;
 };
 
@@ -69,7 +76,6 @@ thread_stack_state_mark(void *s)
     for (frm = state->top; frm; frm = frm->prev) {
         rb_gc_mark(frm->path);
         rb_gc_mark(frm->method_id);
-        rb_gc_mark(frm->binding);
     }
 }
 
@@ -120,6 +126,33 @@ thread_stack_state_get()
 }
 
 static void
+extract_binding_data(rb_trace_arg_t *targ, void **th, void **cfp)
+{
+    struct rb_trace_arg_struct_partial *partial =
+        (struct rb_trace_arg_struct_partial *)targ;
+    *th = partial->th;
+    *cfp = partial->cfp;
+}
+
+static VALUE
+binding_from_frame(struct thread_stack_frame *frm)
+{
+    void *cfp;
+    void *(*get_binding)(void *, void *);
+    void *(*make_binding)(void *, void *);
+    // XXX: how can these symbols be discovered?  They are hidden.
+    // rb_vm_get_binding_creatable_next_cfp and rb_vm_make_binding
+    get_binding = (void *)((char *)0x100004000 + 0x13be50);
+    make_binding = (void *)((char *)0x100004000 + 0x13c244);
+    cfp = get_binding(frm->th, frm->cfp);
+    if (cfp) {
+        return make_binding(frm->th, cfp);
+    } else {
+        return Qnil;
+    }
+}
+
+static void
 thread_stack_state_push(rb_trace_arg_t *targ)
 {
     struct thread_stack_state *state = thread_stack_state_get();
@@ -136,7 +169,7 @@ thread_stack_state_push(rb_trace_arg_t *targ)
     frm->path = rb_tracearg_path(targ);
     frm->lineno = lineno != Qnil ? FIX2LONG(lineno) : 0;
     frm->method_id = rb_tracearg_method_id(targ);
-    frm->binding = rb_tracearg_binding(targ);
+    extract_binding_data(targ, &frm->th, &frm->cfp);
     frm->prev = state->top;
     state->top = frm;
 }
@@ -178,11 +211,12 @@ thread_stack_state_get_frames(VALUE self)
 
     if (state) {
         for (frm = state->top; frm; frm = frm->prev) {
+            VALUE binding = binding_from_frame(frm);
             VALUE args[4] = {
                 frm->path,
                 LONG2FIX(frm->lineno),
                 frm->method_id,
-                frm->binding
+                binding,
             };
             hl_frm = rb_obj_alloc(frame_class);
             rb_obj_call_init(hl_frm, 4, args);
