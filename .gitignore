@@ -1,0 +1,5 @@
+.gems
+ext/rbtrace/*.bundle
+ext/rbtrace/*.o
+ext/rbtrace/Makefile
+Gemfile.lock
