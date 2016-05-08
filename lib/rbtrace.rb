@@ -1,9 +1,6 @@
 module RbTrace
   VERSION = "1.0"
 
-  # Internal frame struct that is constructed by the c extension
-  RawFrame = Struct.new(:path, :lineno, :method_id, :binding)
-
   class Frame
     def initialize(path, lineno, method_id, binding)
       @path = path
@@ -50,10 +47,8 @@ module RbTrace
   end
 
   class Stacktrace
-    def initialize(raw_frames)
-      @frames = raw_frames.map do |raw_frame|
-        Frame.new(*raw_frame)
-      end
+    def initialize(frames)
+      @frames = frames
     end
 
     attr_reader :frames
@@ -64,9 +59,9 @@ module RbTrace
   end
 
   def self.get_stacktrace(exc)
-    raw_stack = exc.instance_variable_get(:@__rbtrace_stack)
-    if raw_stack
-      Stacktrace.new(raw_stack)
+    stack_state = exc.instance_variable_get(:@__rbtrace_state)
+    if stack_state
+      Stacktrace.new(stack_state.frames)
     end
   end
 

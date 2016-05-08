@@ -1,10 +1,6 @@
 require "rbtrace"
 require 'benchmark'
 
-def foo
-  1/0
-end
-
 def bar
   1/0
 end
@@ -63,5 +59,3 @@ def bench
     }
   end
 end
-
-bench

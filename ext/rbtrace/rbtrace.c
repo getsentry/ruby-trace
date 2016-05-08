@@ -13,51 +13,169 @@
 #endif
 
 static ID id_trace_stack;
-static VALUE raw_frame_struct;
+static ID id_rbtrace_state;
+static VALUE thread_stack_state_class;
+static VALUE frame_class;
+
+struct thread_stack_frame;
+struct thread_stack_frame {
+    VALUE path;
+    long lineno;
+    VALUE method_id;
+    VALUE binding;
+    struct thread_stack_frame *prev;
+};
+
+struct thread_stack_state {
+    struct thread_stack_frame *top;
+};
+
+static void
+thread_stack_frame_free(void *f)
+{
+    xfree(f);
+}
+
+static void
+thread_stack_state_free(void *s)
+{
+    struct thread_stack_state *state = (struct thread_stack_state *)s;
+    struct thread_stack_frame *frm, *prev;
+
+    frm = state->top;
+    while (frm) {
+        prev = frm->prev;
+        thread_stack_frame_free(frm);
+        frm = prev;
+    }
+
+    xfree(state);
+}
+
+static void
+thread_stack_state_mark(void *s)
+{
+    struct thread_stack_state *state = (struct thread_stack_state *)s;
+    struct thread_stack_frame *frm;
+
+    for (frm = state->top; frm; frm = frm->prev) {
+        rb_gc_mark(frm->path);
+        rb_gc_mark(frm->method_id);
+        rb_gc_mark(frm->binding);
+    }
+}
 
 static VALUE
-get_thread_stack()
+thread_stack_state_alloc(VALUE self)
 {
-    return rb_thread_local_aref(rb_thread_current(), id_trace_stack);
+    struct thread_stack_state *state = ALLOC(struct thread_stack_state);
+    state->top = NULL;
+    return Data_Wrap_Struct(self, thread_stack_state_mark,
+                            thread_stack_state_free, state);
 }
 
-static void
-push_frame(rb_trace_arg_t *targ)
+static VALUE
+thread_stack_state_init_copy(VALUE copy, VALUE orig)
 {
-    VALUE stack = get_thread_stack();
-    if (stack == Qnil) {
-        stack = rb_ary_new();
-        rb_thread_local_aset(rb_thread_current(), id_trace_stack, stack);
+    struct thread_stack_state *copy_state, *orig_state;
+    struct thread_stack_frame *copy_frm, *orig_frm;
+
+    if (copy == orig) {
+        return copy;
     }
 
-    VALUE raw_frame = rb_funcall(raw_frame_struct, rb_intern("new"), 4,
-                                 rb_tracearg_path(targ),
-                                 rb_tracearg_lineno(targ),
-                                 rb_tracearg_method_id(targ),
-                                 rb_tracearg_binding(targ));
-    rb_ary_push(stack, raw_frame);
+    Data_Get_Struct(copy, struct thread_stack_state, copy_state);
+    Data_Get_Struct(orig, struct thread_stack_state, orig_state);
+
+    for (orig_frm = orig_state->top; orig_frm; orig_frm = orig_frm->prev) {
+        copy_frm = ALLOC(struct thread_stack_frame);
+        memcpy(copy_frm, orig_frm, sizeof(struct thread_stack_frame));
+        copy_frm->prev = copy_state->top;
+        copy_state->top = copy_frm;
+    }
+
+    return copy;
+}
+
+static struct thread_stack_state *
+thread_stack_state_get()
+{
+    struct thread_stack_state *state;
+    VALUE top = rb_thread_local_aref(rb_thread_current(), id_trace_stack);
+    if (top == Qnil) {
+        top = rb_obj_alloc(thread_stack_state_class);
+        rb_obj_call_init(top, 0, NULL);
+        rb_thread_local_aset(rb_thread_current(), id_trace_stack, top);
+    }
+    Data_Get_Struct(top, struct thread_stack_state, state);
+    return state;
 }
 
 static void
-pop_frame(rb_trace_arg_t *targ)
+thread_stack_state_push(rb_trace_arg_t *targ)
 {
-    VALUE stack = get_thread_stack();
-    if (stack != Qnil) {
-        rb_ary_pop(stack);
+    struct thread_stack_state *state = thread_stack_state_get();
+    struct thread_stack_frame *frm;
+    VALUE lineno = rb_tracearg_lineno(targ);
+
+    frm = ALLOC(struct thread_stack_frame);
+    frm->path = rb_tracearg_path(targ);
+    frm->lineno = lineno != Qnil ? FIX2LONG(lineno) : 0;
+    frm->method_id = rb_tracearg_method_id(targ);
+    frm->binding = rb_tracearg_binding(targ);
+    frm->prev = state->top;
+    state->top = frm;
+}
+
+static void
+thread_stack_state_pop(void)
+{
+    struct thread_stack_state *state = thread_stack_state_get();
+    struct thread_stack_frame *frm;
+    if (state->top) {
+        frm = state->top;
+        state->top = frm->prev;
+        thread_stack_frame_free(frm);
     }
 }
 
 static void
-attach_stack_to_exception(rb_trace_arg_t *targ)
+thread_stack_state_attach_to_exception(rb_trace_arg_t *targ)
 {
     VALUE exc = rb_tracearg_raised_exception(targ);
-    VALUE stack = get_thread_stack();
+    VALUE state = rb_thread_local_aref(rb_thread_current(), id_trace_stack);
 
-    if (stack == Qnil || exc == Qnil) {
+    if (state == Qnil || exc == Qnil) {
         return;
     }
 
-    rb_ivar_set(exc, rb_intern("@__rbtrace_stack"), rb_obj_dup(stack));
+    rb_ivar_set(exc, id_rbtrace_state, rb_obj_dup(state));
+}
+
+static VALUE
+thread_stack_state_get_frames(VALUE self)
+{
+    struct thread_stack_state *state;
+    struct thread_stack_frame *frm;
+    VALUE hl_frm;
+    VALUE rv = rb_ary_new();
+    Data_Get_Struct(self, struct thread_stack_state, state);
+
+    if (state) {
+        for (frm = state->top; frm; frm = frm->prev) {
+            VALUE args[4] = {
+                frm->path,
+                LONG2FIX(frm->lineno),
+                frm->method_id,
+                frm->binding
+            };
+            hl_frm = rb_obj_alloc(frame_class);
+            rb_obj_call_init(hl_frm, 4, args);
+            rb_ary_push(rv, hl_frm);
+        }
+    }
+
+    return rv;
 }
 
 static void
@@ -67,13 +185,13 @@ tracepoint_callback(VALUE tp, void *data)
 
     switch (TRACEPOINT_EVENT_FLAG(targ)) {
     case RUBY_EVENT_CALL:
-        push_frame(targ);
+        thread_stack_state_push(targ);
         break;
     case RUBY_EVENT_RETURN:
-        pop_frame(targ);
+        thread_stack_state_pop();
         break;
     case RUBY_EVENT_RAISE:
-        attach_stack_to_exception(targ);
+        thread_stack_state_attach_to_exception(targ);
         break;
     }
 }
@@ -92,8 +210,19 @@ Init_rbtrace(void)
 {
     VALUE mod;
 
+    id_rbtrace_state = rb_intern("@__rbtrace_state");
+
     mod = rb_const_get(rb_cObject, rb_intern("RbTrace"));
     rb_define_module_function(
         mod, "make_tracepoint", tracepoint_create, 0);
-    raw_frame_struct = rb_const_get(mod, rb_intern("RawFrame"));
+
+    thread_stack_state_class = rb_define_class_under(
+        mod, "StackState", rb_cObject);
+    rb_define_alloc_func(thread_stack_state_class, thread_stack_state_alloc);
+    rb_define_method(thread_stack_state_class, "initialize_copy",
+                     thread_stack_state_init_copy, 1);
+    rb_define_method(thread_stack_state_class, "frames",
+                     thread_stack_state_get_frames, 0);
+
+    frame_class = rb_const_get(mod, rb_intern("Frame"));
 }
